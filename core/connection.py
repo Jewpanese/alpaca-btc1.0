@@ -287,7 +287,10 @@ class AlpacaCryptoConnection:
                     if mark > 0:
                         btc = lmv / mark
 
-            if btc < 1e-6:
+            # Dust threshold: amounts below 0.001 BTC (~$80) are residual from
+            # rounding/fees and not actionable positions. Treating them as
+            # "flat" stops the bot from trying to flatten on every startup.
+            if btc < 0.001:
                 return []
 
             avg_entry = self._estimate_avg_entry()
@@ -584,8 +587,19 @@ class AlpacaCryptoConnection:
                 logger.info("flatten_all: already flat")
                 self._brackets.clear()
                 return True
-            # Safety margin against Alpaca precision rejection
-            btc_to_sell = float(f"{btc * 0.999:.5f}")
+            # Dust threshold: positions below ~$80 (0.001 BTC) aren't worth fighting
+            # Alpaca's precision-rejection-prone sub-mBTC settlement quirks for.
+            # Mark them as flat in the bot's view; they'll burn off in fees or
+            # next real round-trip.
+            DUST_BTC = 0.001
+            if btc < DUST_BTC:
+                logger.info(f"flatten_all: ignoring dust position {btc:.8f} BTC (< {DUST_BTC} BTC threshold)")
+                self._brackets.clear()
+                return True
+            # Floor-truncate to 5 decimals (NOT f-string rounding — that rounds
+            # to nearest and can round back UP past the available qty).
+            import math
+            btc_to_sell = math.floor(btc * 0.999 * 100_000) / 100_000
             if btc_to_sell <= 0:
                 logger.info("flatten_all: position below minimum sell unit — leaving as dust")
                 self._brackets.clear()
