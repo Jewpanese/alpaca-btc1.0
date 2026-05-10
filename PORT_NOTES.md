@@ -168,6 +168,101 @@ and Alpaca paper will show a BTC/USD position.
   Bot gracefully degrades. Optional Phase C: rebuild on BTC history via
   `research/build_volume_baseline.py` (port required).
 
+## Critical Bugs 2026-05-10 (afternoon) — orders went through but bot lost track
+
+A signal-firing session at 09:46-09:58 surfaced **three intertwined bugs** in the
+Alpaca adapter that together produced a misleading "$4,884 loss" picture when the
+account had actually only lost ~$25.
+
+### What happened
+
+Three BUY orders fired in 9 minutes:
+
+```
+09:49:03 BUY 0.02 BTC @ $81,331  (filled on Alpaca)
+09:56:01 BUY 0.02 BTC @ $81,425  (filled on Alpaca)
+09:58:51 BUY 0.02 BTC @ $81,430  (filled on Alpaca)
+```
+
+Bot logged each as `place_order failed: BUY 2 @ BTC/USD: Invalid format specifier
+'.2f if stop_price else 0' for object of type 'float'` and reported `0 trades`
+in the session summary. But Alpaca confirmed all three filled (`fetch_my_trades`
+returned them with `status=closed, filled=0.02`). The bot never tracked the
+0.06 BTC it had bought.
+
+### Bug 1 — broken f-string
+
+[`core/connection.py:404`](core/connection.py#L404) had:
+
+```python
+f"SL=${stop_price:.2f if stop_price else 0} "  # invalid syntax
+```
+
+Python rejects `:.2f if stop_price else 0` as a format spec. The order
+placement on line 374 (`self.exchange.create_order(...)`) succeeds and submits
+the order to Alpaca, but the subsequent log line throws `ValueError`, the outer
+try/except catches it, and `place_order` returns `False`. **The bot is now
+desynchronized from Alpaca's reality.**
+
+Fix: pre-format the values into strings before the f-string.
+
+### Bug 2 — `get_account_balance()` returned cash, not equity
+
+`bal["free"]["USD"]` only shows uninvested cash. When you hold BTC, that's
+just one slice of the account. ccxt-Alpaca puts the full picture under `bal["info"]`:
+
+| Field | Meaning |
+|---|---|
+| `info.cash` | $94,973.88 — uninvested USD |
+| `info.long_market_value` | $4,879.46 — BTC position market value |
+| `info.equity` | $99,853.34 — cash + position |
+| `info.portfolio_value` | $99,853.34 — same |
+
+The bot was reading `free.USD` ($94,973.88) and interpreting the $4,884 in
+deployed capital as a **loss**. This drove the spurious `[RISK] PNL SYNC:
+Session=-$4,883.97 vs Local=$0` warnings and triggered the emergency shutdown.
+
+Fix: `get_account_balance()` now prefers `info.equity` over free cash; added
+`get_cash_balance()` for cases that genuinely want free USD only.
+
+### Bug 3 — `get_open_positions()` couldn't see the BTC
+
+`bal["total"]["BTC"]` is **not populated** by ccxt-Alpaca for crypto spot
+positions. The actual quantity has to be derived from `long_market_value /
+mark_price`. ccxt's `fetch_positions()` raises `NotSupported`.
+
+Fix: derive BTC from `long_market_value / mark_price` when `total.BTC` is
+empty. `flatten_all()` got the same fix.
+
+### Bonus: precision in `flatten_all`
+
+Selling exactly `long_market_value / mark` rejects with `insufficient balance`
+because the mark moves between fills and the sell submission, making the
+derived qty round slightly above actual. Fix: 0.1% safety margin and round to
+5 decimals (`btc_to_sell = float(f"{btc * 0.999:.5f}")`).
+
+### Cleanup
+
+Manually flattened the 0.06 BTC orphan position. Final state:
+
+- Total equity: **$99,832.63** (was $99,857.85 SOD → actual session P&L: **-$25**)
+- BTC: 0.00004 (dust, below sell minimum)
+- Open orders: 0
+
+Real-world cost of the bugs: $25 in spread/slippage on a buggy round-trip,
+not the $4,884 the bot was reporting.
+
+### Lesson
+
+**Always test order placement against live broker, not just smoke-test the
+adapter import.** The f-string bug was syntactically valid Python (it parsed
+fine), only the *runtime* format-spec evaluation failed. Running through a
+real entry+exit cycle would have surfaced it Day 1. Add to the "audit posture"
+memory: scan for `place_order failed`, `format specifier`, `ValueError` in
+every live session log.
+
+---
+
 ## Sizing Refactor 2026-05-10 — spot %-of-account sizing
 
 Replaced the futures-prop sizing approach (fixed-$ risk + cushion-tier max contracts) with **standard quant fixed-fractional sizing** appropriate for BTC spot.

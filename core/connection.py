@@ -188,13 +188,46 @@ class AlpacaCryptoConnection:
     # ------------------------------------------------------------------
 
     def get_account_balance(self) -> Optional[float]:
+        """
+        Return TOTAL EQUITY (cash + crypto position market value), not just free cash.
+
+        ccxt-Alpaca quirk: when you hold a BTC position, `bal["total"]["BTC"]`
+        is NOT populated and `bal["free"]["USD"]` only shows uninvested cash.
+        The full picture lives under `bal["info"]`:
+            info.cash               — free USD
+            info.long_market_value  — current $ value of all crypto positions
+            info.equity             — cash + long_market_value (this is what we want)
+            info.portfolio_value    — same as equity for paper accounts
+
+        Without this fix the bot would interpret deployed capital as a "loss"
+        and trigger spurious PNL-sync warnings + emergency shutdown.
+        """
         try:
             bal = self._retry(self.exchange.fetch_balance)
-            usd = bal.get("free", {}).get("USD", 0) or bal.get("USD", {}).get("free", 0) or 0
-            return float(usd)
+            info = bal.get("info", {}) or {}
+            equity = info.get("equity") or info.get("portfolio_value")
+            if equity is not None:
+                return float(equity)
+            # Fallback: cash + crypto value at mark
+            cash = float(info.get("cash") or bal.get("free", {}).get("USD", 0) or 0)
+            crypto_val = float(info.get("long_market_value") or 0)
+            if cash + crypto_val > 0:
+                return cash + crypto_val
+            # Final fallback: free USD only (legacy behavior)
+            return float(bal.get("free", {}).get("USD", 0) or 0)
         except Exception as e:
             logger.error(f"get_account_balance failed: {e}")
             return None
+
+    def get_cash_balance(self) -> float:
+        """Free USD cash only — for sizing notional caps that need uninvested $."""
+        try:
+            bal = self._retry(self.exchange.fetch_balance)
+            info = bal.get("info", {}) or {}
+            return float(info.get("cash") or bal.get("free", {}).get("USD", 0) or 0)
+        except Exception as e:
+            logger.error(f"get_cash_balance failed: {e}")
+            return 0.0
 
     def get_account_pnl(self) -> Optional[dict]:
         """Approximate Topstep-shaped PnL summary from Alpaca balances and BTC mark."""
@@ -229,20 +262,40 @@ class AlpacaCryptoConnection:
 
     def get_open_positions(self) -> Optional[List[dict]]:
         """
-        Return positions in Topstep-shaped dicts. For BTC spot, position = BTC balance > 0.
-        Returns [] on confirmed flat, None on error (matches TopstepConnection contract).
+        Return positions in Topstep-shaped dicts. Returns [] on confirmed flat,
+        None on error (matches TopstepConnection contract).
+
+        ccxt-Alpaca quirk: `bal["total"]["BTC"]` is not populated for crypto
+        spot positions. We have to derive BTC quantity from
+        `info.long_market_value` divided by current mark price. (Alpaca's
+        `/v2/positions` endpoint does return BTC qty directly but ccxt's
+        Alpaca adapter returns NotSupported on `fetch_positions`.)
         """
         try:
             bal = self._retry(self.exchange.fetch_balance)
+            info = bal.get("info", {}) or {}
+
+            # Path A: ccxt eventually surfaces BTC in total — keep this for
+            # forward compat in case Alpaca/ccxt fixes it.
             btc = float(bal.get("total", {}).get("BTC", 0) or 0)
+
+            # Path B (current reality): derive from long_market_value / mark
+            if btc < 1e-6:
+                lmv = float(info.get("long_market_value") or 0)
+                if lmv > 0:
+                    mark = self._get_mark_price()
+                    if mark > 0:
+                        btc = lmv / mark
+
             if btc < 1e-6:
                 return []
+
             avg_entry = self._estimate_avg_entry()
-            net_size_contracts = int(round(btc / self.contract_size_btc))
+            net_size_contracts = max(1, int(round(btc / self.contract_size_btc)))
             return [{
                 "contractId": self.symbol,
-                "size": net_size_contracts,           # native contract count
-                "netSize": net_size_contracts,        # Topstep convention (>0 = long)
+                "size": net_size_contracts,
+                "netSize": net_size_contracts,
                 "btcSize": btc,
                 "averagePrice": avg_entry,
                 "type": "LONG",
@@ -399,10 +452,11 @@ class AlpacaCryptoConnection:
                     order_id=local_id, side=side, contracts=size, btc_size=btc_size,
                     entry_price=fill_price, stop_price=stop_price, target_price=target_price,
                 )
+                _sl_str = f"${stop_price:.2f}" if stop_price else "—"
+                _tp_str = f"${target_price:.2f}" if target_price else "—"
                 logger.info(
                     f"Bracket tracked: id={local_id} entry=${fill_price:.2f} "
-                    f"SL=${stop_price:.2f if stop_price else 0} "
-                    f"TP=${target_price:.2f if target_price else 0}"
+                    f"SL={_sl_str} TP={_tp_str}"
                 )
 
             logger.info(
@@ -503,18 +557,41 @@ class AlpacaCryptoConnection:
             logger.error(f"partial_close failed: {e}")
             return False
 
-    def flatten_all(self, contract_id: str, reason: str = "") -> bool:
-        """Cancel any working orders + sell entire BTC balance."""
+    def flatten_all(self, contract_id: str, reason: str = "", **kwargs) -> bool:
+        """Cancel any working orders + sell entire BTC balance.
+
+        Same `total.BTC` quirk as get_open_positions: derive from
+        `info.long_market_value` if total balance not surfaced by ccxt.
+
+        Precision: `long_market_value / mark` rounds slightly higher than the
+        actual held BTC (because mark moves between fills and settlement).
+        Apply a 0.1% safety margin and round down to 5 decimals so Alpaca
+        doesn't reject the sell with `insufficient balance`.
+        """
         self._cancel_all_working_orders(reason=f"flatten_all: {reason}")
         try:
             bal = self._retry(self.exchange.fetch_balance)
+            info = bal.get("info", {}) or {}
             btc = float(bal.get("total", {}).get("BTC", 0) or 0)
+            if btc < 1e-6:
+                # Derive from long_market_value / mark price (Alpaca crypto quirk)
+                lmv = float(info.get("long_market_value") or 0)
+                if lmv > 0:
+                    mark = self._get_mark_price()
+                    if mark > 0:
+                        btc = lmv / mark
             if btc < 1e-6:
                 logger.info("flatten_all: already flat")
                 self._brackets.clear()
                 return True
+            # Safety margin against Alpaca precision rejection
+            btc_to_sell = float(f"{btc * 0.999:.5f}")
+            if btc_to_sell <= 0:
+                logger.info("flatten_all: position below minimum sell unit — leaving as dust")
+                self._brackets.clear()
+                return True
             order = self._retry(
-                self.exchange.create_order, self.symbol, "market", "sell", btc
+                self.exchange.create_order, self.symbol, "market", "sell", btc_to_sell
             )
             fill_price = float(order.get("average") or order.get("price") or self._get_mark_price())
             local_id = self._alloc_order_id()
