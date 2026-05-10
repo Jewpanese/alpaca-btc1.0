@@ -18,10 +18,19 @@ import json
 import pickle
 import logging
 import numpy as np
-import lightgbm as lgb
 from dataclasses import dataclass
 from typing import Optional
 from collections import deque
+
+# lightgbm is only needed when an actual ML model is loaded (production models
+# trained on ES history). For the BTC port no such model exists, so the import
+# is lazy — degrade gracefully when the lib isn't installed.
+try:
+    import lightgbm as lgb  # noqa: F401
+    _LIGHTGBM_AVAILABLE = True
+except ImportError:
+    lgb = None
+    _LIGHTGBM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
