@@ -1,0 +1,11 @@
+ccxt>=4.0
+requests>=2.28
+numpy>=1.24
+pandas>=2.0
+python-dotenv>=1.0
+pytz>=2023.3
+# signalrcore retained for compat (some imports reference it but it's unused on Alpaca)
+signalrcore>=0.9
+websockets>=11.0
+# Claude Opus 4.7 — used by analyzers/eod_summary.py (end-of-day review)
+anthropic>=0.92.0
